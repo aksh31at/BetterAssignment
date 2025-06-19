@@ -1,0 +1,68 @@
+stages:
+  - build
+  - test
+  - deploy
+
+variables:
+  DOCKER_HOST: tcp://docker:2375
+  DOCKER_DRIVER: overlay2
+  IMAGE_NAME: $CI_REGISTRY_IMAGE/chat-app:$CI_COMMIT_SHA
+  DOCKER_COMPOSE_FILE: docker-compose.yaml
+  AWS_REGION: us-east-1
+
+build_job:
+  stage: build
+  image: docker:20.10
+  services:
+    - docker:dind
+  before_script:
+    - apk add --no-cache bash curl
+    - docker info
+  script:
+    - cd chat-Frontend && npm install && npm run build
+    - cd ../backend && npm install
+    - docker build -t $IMAGE_NAME backend/
+    - docker save -o chat-app.tar $IMAGE_NAME
+
+test_job:
+  stage: test
+  image: node:18
+  script:
+    - cd chat-Frontend && npm install && npm test
+    - cd ../backend && npm install && npm test
+  # Note: Add test scripts to package.json if not present (e.g., "test": "echo 'No tests'")
+  allow_failure: true
+
+deploy_job:
+  stage: deploy
+  image: docker:20.10
+  services:
+    - docker:dind
+  before_script:
+    - apk add --no-cache aws-cli terraform
+    - aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID
+    - aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY
+    - aws configure set default.region $AWS_REGION
+    - terraform init
+  script:
+    - docker load -i chat-app.tar
+    - terraform apply -auto-approve -var "key_name=chat-app" -var "instance_name=buzz-chat-server"
+    - aws ec2 wait instance-running --filters "Name=tag:Name,Values=buzz-chat-server"
+    - aws ec2 describe-instances --filters "Name=tag:Name,Values=buzz-chat-server" --query "Reservations[*].Instances[*].PublicIpAddress" --output text > public_ip.txt
+    - PUBLIC_IP=$(cat public_ip.txt)
+    - docker-compose -f $DOCKER_COMPOSE_FILE up --build -d --scale frontend=1 --scale backend=1
+  environment:
+    name: production
+  when: manual
+
+post_deploy:
+  stage: deploy
+  image: docker:20.10
+  services:
+    - docker:dind
+  script:
+    - terraform destroy -auto-approve
+  when: on_success
+  environment:
+    name: production
+  allow_failure: true
